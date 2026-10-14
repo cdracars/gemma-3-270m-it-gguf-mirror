@@ -1,0 +1,82 @@
+name: Mirror Gemma GGUF
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gemma-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      HF_REPO: unsloth/gemma-3-270m-it-GGUF
+      HF_FILE: gemma-3-270m-it-Q8_0.gguf
+      RELEASE_PREFIX: upstream-
+      EXPECTED_SHA256: d156a5159f2f79c1b1d53c7c1cc20f1ff28ab8d00f17a292620aad13399b9698
+    steps:
+      - name: Check upstream metadata
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://huggingface.co/api/models/${HF_REPO}/tree/main?recursive=true"
+          metadata="$(curl --fail --location --retry 3 --silent --show-error "$api")"
+          file_json="$(jq -c --arg file "$HF_FILE" '.[] | select(.path == $file)' <<<"$metadata")"
+          test -n "$file_json"
+          upstream_sha="$(jq -r '.lfs.oid // .oid // empty' <<<"$file_json")"
+          test -n "$upstream_sha"
+          echo "sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "Upstream file hash: $upstream_sha"
+
+      - name: Check whether release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_PREFIX}${{ steps.upstream.outputs.sha }}"
+          if gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Release $tag does not exist."
+          fi
+
+      - name: Download and verify GGUF
+        if: steps.existing.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://huggingface.co/${HF_REPO}/resolve/main/${HF_FILE}?download=true"
+          curl --fail --location --retry 3 --silent --show-error "$url" --output "$HF_FILE"
+          actual="$(sha256sum "$HF_FILE" | cut -d' ' -f1)"
+          expected="${EXPECTED_SHA256}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Downloaded file hash $actual does not match expected $expected"
+            exit 1
+          fi
+          printf '%s  %s\n' "$actual" "$HF_FILE" > SHA256SUMS
+          printf 'Upstream repository: https://huggingface.co/%s\nUpstream file: %s\nUpstream revision: %s\nSHA-256: %s\n' "${HF_REPO}" "${HF_FILE}" "${{ steps.upstream.outputs.sha }}" "$actual" > RELEASE_METADATA.txt
+
+      - name: Publish GitHub Release
+        if: steps.existing.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_PREFIX}${{ steps.upstream.outputs.sha }}"
+          gh release create "$tag" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Gemma 3 270M IT GGUF — ${{ steps.upstream.outputs.sha }}" \
+            --notes-file RELEASE_METADATA.txt \
+            "${HF_FILE}" SHA256SUMS NOTICE
